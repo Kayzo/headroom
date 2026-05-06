@@ -31,9 +31,10 @@ class _DummyMetrics:
         self.ws_session_durations: list[float] = []
         self.stage_timings: list[tuple[str, dict[str, float]]] = []
         self.termination_causes: list[str] = []
+        self.recorded_requests: list[dict] = []
 
-    async def record_request(self, **kwargs):  # pragma: no cover
-        return None
+    async def record_request(self, **kwargs):
+        self.recorded_requests.append(dict(kwargs))
 
     async def record_stage_timings(self, path: str, timings: dict[str, float]) -> None:
         self.stage_timings.append((path, dict(timings)))
@@ -79,6 +80,9 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
 
     async def _next_request_id(self) -> str:
         return "req-lifecycle-test"
+
+    async def _run_compression_in_executor(self, fn, *, timeout: float):
+        return fn()
 
 
 class _FakeWebSocketDisconnect(Exception):
@@ -217,6 +221,15 @@ def _first_frame() -> str:
     )
 
 
+def _second_frame() -> str:
+    return json.dumps(
+        {
+            "type": "response.create",
+            "response": {"model": "gpt-5.4", "input": "follow up"},
+        }
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -250,6 +263,79 @@ async def test_happy_path_registry_empty_after_response_completed():
         "client_disconnect",
         "upstream_disconnect",
     }
+
+
+@pytest.mark.asyncio
+async def test_multiple_response_create_frames_each_record_a_request():
+    from headroom.config import TransformResult
+
+    class _LengthTokenizer:
+        def count_messages(self, messages):
+            total = 0
+            for message in messages:
+                content = message.get("content", "")
+                total += len(content) if isinstance(content, str) else 1
+            return total
+
+    upstream_events = [
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_2"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events, hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    first_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "verbose verbose verbose verbose verbose verbose verbose",
+            },
+        }
+    )
+    second_frame = json.dumps(
+        {
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "followup followup followup followup followup followup",
+            },
+        }
+    )
+    client_ws = _FakeWebSocket(frames=[first_frame, second_frame], hold_after_initial=True)
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler.openai_pipeline.apply = MagicMock(
+        return_value=TransformResult(
+            messages=[{"role": "user", "content": "short"}],
+            tokens_before=30,
+            tokens_after=5,
+            transforms_applied=["router:kompress:0.10"],
+        )
+    )
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        with patch("headroom.tokenizers.get_tokenizer", lambda model: _LengthTokenizer()):
+            trigger_task = asyncio.create_task(_trigger())
+            try:
+                await asyncio.wait_for(handler.handle_openai_responses_ws(client_ws), timeout=2.0)
+            finally:
+                trigger_task.cancel()
+                try:
+                    await trigger_task
+                except asyncio.CancelledError:
+                    pass
+
+    assert len(handler.metrics.recorded_requests) == 2
+    assert [req["model"] for req in handler.metrics.recorded_requests] == ["gpt-5.4", "gpt-5.4"]
+    assert all(req["provider"] == "openai" for req in handler.metrics.recorded_requests)
+    assert all(req["tokens_saved"] > 0 for req in handler.metrics.recorded_requests)
+    assert len(upstream.sent) == 2
+    assert json.loads(upstream.sent[0])["response"]["input"] == "short"
+    assert json.loads(upstream.sent[1])["response"]["input"] == "short"
 
 
 @pytest.mark.asyncio

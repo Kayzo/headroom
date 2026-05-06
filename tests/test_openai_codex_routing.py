@@ -110,7 +110,14 @@ class _DummyMetrics:
 
 class _DummyTokenizer:
     def count_messages(self, messages):
-        return len(messages)
+        total = 0
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                total += max(1, len(content))
+            else:
+                total += 1
+        return total
 
 
 class _ResponseStub:
@@ -246,10 +253,9 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert response.status_code == 200
 
 
-def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
-    """PR-C5: Python no longer compresses /v1/responses (Rust handles it
-    natively). The streaming forward path must still fire — only the
-    Python compression dispatch is retired."""
+def test_handle_openai_responses_stream_compresses_items_in_place(monkeypatch):
+    from headroom.config import TransformResult
+
     request = _build_request(
         {
             "model": "gpt-5.4",
@@ -259,7 +265,12 @@ def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
                 {
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "hello"}],
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "verbose verbose verbose verbose verbose verbose verbose",
+                        }
+                    ],
                 }
             ],
         },
@@ -267,6 +278,14 @@ def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     )
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
+    handler.openai_pipeline.apply = MagicMock(
+        return_value=TransformResult(
+            messages=[{"role": "user", "content": "short"}],
+            tokens_before=50,
+            tokens_after=5,
+            transforms_applied=["router:kompress:0.10"],
+        )
+    )
 
     monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
 
@@ -274,8 +293,9 @@ def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
 
     assert response.status_code == 200
     assert handler.captured_stream_request is not None
-    assert handler.openai_pipeline.apply.call_count == 0
+    assert handler.openai_pipeline.apply.call_count == 1
     assert handler.captured_stream_request[2]["stream"] is True
+    assert handler.captured_stream_request[2]["input"][0]["content"][0]["text"] == "short"
 
 
 def test_handle_openai_responses_memory_timeout_fails_open(monkeypatch):
